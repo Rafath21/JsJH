@@ -28,6 +28,9 @@ import yaml
 from dateutil import parser as dateparser
 from rapidfuzz import fuzz, process
 
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
 # ---------------------------
 # Config + constants
 # ---------------------------
@@ -119,6 +122,14 @@ NON_US_HARD_BLOCK = [
 ]
 
 COUNTRY_TLD_BLOCK = [".co.uk",".de",".fr",".ca",".au",".in",".sg",".jp",".uk",".eu",".ie",".nz",".br",".mx"]
+
+
+RESUME_PROFILE = """
+Machine Learning Engineer with strengths in Computer Vision (PyTorch, ONNX/TensorRT),
+LLM/RAG (Transformers, LoRA/PEFT, LangChain/LlamaIndex), and model serving (FastAPI, Kubernetes/EKS, KServe/BentoML),
+MLOps (MLflow, CI/CD, Airflow/Kubeflow), Observability (OTel/Prometheus/Grafana/Datadog), AWS EKS.
+"""
+
 
 def looks_non_us(text: str) -> bool:
     t = to_lower(text)
@@ -212,13 +223,13 @@ def seniority_allowed(s: str, min_s: str, max_s: str) -> bool:
     i = order.index(s if s in order else "mid")
     return order.index(min_s) <= i <= order.index(max_s)
 
-def guess_work_mode(location_str: str) -> str:
+def guess_work_mode(location_str: str, desc: str = "") -> str:
     l = to_lower(location_str)
-    if "remote" in l or "anywhere" in l or "distributed" in l:
+    d = to_lower(desc)
+    if "remote" in l or "remote" in d or "distributed" in d:
         return "remote"
-    if "hybrid" in l:
+    if "hybrid" in l or "hybrid" in d:
         return "hybrid"
-    # if it mentions a city only
     return "onsite"
 
 def is_local_stl(location_str: str, radius_km: int = 50) -> bool:
@@ -247,7 +258,7 @@ def allowed_by_location_and_mode(loc_str: str, mode: str, cfg: dict, desc: str =
     if mode in ("hybrid","onsite"):
         regs = cfg.get("locations",{}).get("local_roles_regions",[])
         for r in regs:
-            if is_local_stl(loc_str, r.get("radius_km", 50)):
+            if is_local_stl(loc_str, r.get("radius_km", 50)) or is_local_stl(desc, r.get("radius_km", 50)):
                 return True
         return False
 
@@ -359,44 +370,60 @@ def fetch_ashby(org: str) -> List[dict]:
         })
     return out
 
-def fetch_workday(base_url: str, company: str) -> List[dict]:
+def fetch_workday(cxs_base: str, company: str) -> list[dict]:
     """
-    Generic Workday job fetcher.
-    base_url = Workday jobs API endpoint up to /fs or /tas
-    e.g., Mastercard: https://mastercard.wd1.myworkdayjobs.com/en-US/CorporateCareers
+    Use Workday CXS API:
+      Mastercard: https://mastercard.wd1.myworkdayjobs.com/wday/cxs/mastercard/CorporateCareers/jobs
+      Charter:    https://charter.wd5.myworkdayjobs.com/wday/cxs/charter/SearchJobs/jobs
+      NVIDIA:     https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs
+      Tesla:      https://tesla.wd5.myworkdayjobs.com/wday/cxs/tesla/TeslaCareers/jobs
+      Adobe:      https://adobe.wd5.myworkdayjobs.com/wday/cxs/adobe/external_experienced/jobs
     """
     jobs = []
-    # Workday uses offset pagination
-    offset, page_size = 0, 50
+    offset, limit = 0, 50
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     while True:
-        url = f"{base_url}/fs/search/jobs?offset={offset}&limit={page_size}"
-        r = http_get(url)
-        if not r: break
+        url = f"{cxs_base}?offset={offset}&limit={limit}"
+        r = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+        if r.status_code != 200:
+            print(f"  [!] workday {company}: HTTP {r.status_code} at {url}")
+            break
+        if "application/json" not in (r.headers.get("content-type","")):
+            print(f"  [!] workday {company}: non-JSON content at {url}")
+            break
         data = r.json()
-        postings = data.get("jobPostings", [])
-        if not postings: break
+        postings = data.get("jobPostings") or data.get("jobs") or []
+        if not postings:
+            break
         for j in postings:
             title = j.get("title") or ""
-            location = ", ".join(j.get("locationsText", [])) if j.get("locationsText") else ""
-            urlj = j.get("externalPath") or ""
-            if urlj and not urlj.startswith("http"):
-                urlj = base_url.split("/fs")[0] + urlj
+            locs = j.get("locationsText") or j.get("locations") or []
+            location = ", ".join(locs) if isinstance(locs, list) else (locs or "")
+            urlj = j.get("externalPath") or j.get("jobPostingId") or ""
+            if urlj and not str(urlj).startswith("http"):
+                # build full URL from base
+                host = cxs_base.split("/wday/")[0]
+                urlj = f"{host}{urlj}"
+            desc = j.get("externalPostingDescription") or j.get("briefDescription") or ""
+            posted = j.get("postedOn") or j.get("startDate") or j.get("postedDate")
             jobs.append({
                 "source": "workday",
                 "company": company,
                 "title": title,
-                "location": location,
+                "location": location or "Unspecified",
                 "url": urlj,
-                "posted_at": j.get("postedOn"),
-                "description": j.get("externalPostingDescription") or "",
+                "posted_at": posted,
+                "description": desc,
                 "employment_type": j.get("timeType") or None,
                 "salary_min": None,
                 "salary_max": None,
             })
-        offset += page_size
-        if offset >= data.get("total", 0):
+        offset += limit
+        total = data.get("total", 0)
+        if total and offset >= total:
             break
     return jobs
+
 
 def fetch_workable(slug: str) -> List[dict]:
     """
@@ -450,7 +477,7 @@ def normalize_job(j: dict) -> dict:
 
     # Seniority + mode
     seniority = detect_seniority(title)
-    mode = guess_work_mode(location)
+    mode = guess_work_mode(location, desc)
 
     return {
         "job_id": hash_id(j.get("url") or f"{company}|{title}|{location}|{j.get('source')}"),
@@ -709,8 +736,7 @@ def collect_jobs(cfg: dict) -> List[dict]:
             jobs.extend(r)
     return jobs
 
-
-def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str], resume_vec) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Normalize
     normed = [normalize_job(j) for j in all_jobs]
     # Dedup
@@ -723,6 +749,13 @@ def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str]) -> Tupl
             continue
         if not passes_hard_filters(j, cfg):
             continue
+        # Reviewer gate (embeddings + rules)
+        keep, sim, reason = reviewer_keep(j, cfg, resume_vec)
+        if not keep:
+            # optional: count as negative or log
+            continue
+        j["review_sim"] = round(sim, 4)
+        j["review_reason"] = reason
         # Score
         score, why = score_job(j, cfg)
         j["relevance_score"] = round(score * 100, 2)
@@ -738,7 +771,8 @@ def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str]) -> Tupl
 
     # Build DataFrames
     cols = ["title","company","location","work_mode","posted_at","salary_min","salary_max","currency",
-            "employment_type","seniority","tech_stack","url","source","relevance_score","why_it_matches"]
+            "employment_type","seniority","tech_stack","url","source","relevance_score","why_it_matches",
+            "review_sim","review_reason"]
     df_all = pd.DataFrame(candidates, columns=cols)
     df_top = pd.DataFrame(top50, columns=cols)
     return df_top, df_all
@@ -775,6 +809,46 @@ def export_excel(df_top: pd.DataFrame, df_all: pd.DataFrame, cfg: dict, out_path
         }])
         run_log.to_excel(writer, sheet_name="Run Log", index=False)
 
+def reviewer_keep(j: dict, cfg: dict, resume_vec: np.ndarray) -> tuple[bool, float, str]:
+    rv = cfg.get("review", {}) or {}
+    if not rv.get("enable", False):
+        return True, 1.0, "review disabled"
+
+    # quick hard filters/boosts
+    hard_neg = [x.lower() for x in rv.get("hard_negatives_any", [])]
+    if any(x in (j["title"] + " " + j["description"]).lower() for x in hard_neg):
+        return False, 0.0, "hard negative"
+
+    hard_pos = [x.lower() for x in rv.get("hard_keywords_any", [])]
+    has_pos = any(x in j["description"].lower() or x in j["title"].lower() for x in hard_pos)
+
+    # embedding similarity
+    model_name = rv.get("embed_model", "BAAI/bge-small-en-v1.5")
+    text = f'{j["title"]}\n{j["company"]}\n{j["location"]}\n{j["description"][:4000]}'
+    vec = embed([text], model_name)[0]
+    sim = cosine(resume_vec, vec)
+
+    # decision
+    if sim >= rv.get("min_cosine", 0.41) or has_pos:
+        return True, sim, "sim_ok" if sim >= rv.get("min_cosine", 0.41) else "keyword_ok"
+    return False, sim, "sim_low"
+
+_EMB_MODEL = None
+_RESUME_VEC = None
+
+def load_embedder(name: str):
+    global _EMB_MODEL
+    if _EMB_MODEL is None:
+        _EMB_MODEL = SentenceTransformer(name)
+    return _EMB_MODEL
+
+def embed(texts: list[str], model_name: str) -> np.ndarray:
+    mdl = load_embedder(model_name)
+    return np.array(mdl.encode(texts, normalize_embeddings=True))
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -784,6 +858,13 @@ def main():
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
+    
+    # Initialize resume vector for reviewer
+    resume_vec = embed(
+        [RESUME_PROFILE],
+        (cfg.get("review", {}) or {}).get("embed_model", "BAAI/bge-small-en-v1.5")
+    )[0]
+
 
     out_path = args.out or (cfg.get("output", {}).get("excel_path") or f"./out/Top50_Mariah_{datetime.now().date()}.xlsx")
     seen_path = args.seen or (cfg.get("run", {}).get("seen_csv_path"))
@@ -797,14 +878,14 @@ def main():
     print(f"    seen so far: {len(seen_ids)}")
 
     print("[3/4] Filtering, scoring, ranking ...")
-    df_top, df_all = filter_and_rank(all_jobs, cfg, seen_ids)
+    df_top, df_all = filter_and_rank(all_jobs, cfg, seen_ids, resume_vec)
 
     # Auto-relax...
     if len(df_all) < 50 and cfg.get("locations", {}).get("remote_ok", False):
         print("    too few results — relaxing remote strictness and retrying once...")
         cfg_relaxed = json.loads(json.dumps(cfg))
         cfg_relaxed.setdefault("locations", {})["remote_strict"] = False
-        df_top, df_all = filter_and_rank(all_jobs, cfg_relaxed, seen_ids)
+        df_top, df_all = filter_and_rank(all_jobs, cfg_relaxed, seen_ids, resume_vec)
         print(f"    after relax: kept {len(df_all)}; top {len(df_top)}")
 
     print(f"[4/4] Exporting Excel → {out_path}")

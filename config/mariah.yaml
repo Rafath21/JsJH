@@ -48,3 +48,10 @@ environment:
   python: "3.11"
   resume_path: "./resume/mariah_banu.pdf"
 
+review:
+  enable: true
+  embed_model: "BAAI/bge-small-en-v1.5"
+  min_cosine: 0.41        # start here; you can tune
+  hard_keywords_any: ["Computer Vision","LLM","RAG","Kubernetes","FastAPI","MLflow","TensorRT","ONNX"]
+  hard_negatives_any: ["IT Helpdesk","Sales","Account Executive","Banking","Finance Auditor"]
+
