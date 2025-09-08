@@ -36,6 +36,7 @@ DEFAULT_TIMEOUT = 20
 USER_AGENT = "Top50-JobFinder/1.0 (+personal use; respectful rate limit)"
 TODAY = datetime.now(timezone.utc)
 DROP_COUNTS = {"seniority":0,"location":0,"employment":0,"negative":0,"age":0}
+DROPPED_LOCATION_SAMPLES = []
 
 # Titles & skill keywords tailored to Mariah (from your plan)
 TITLE_SYNONYMS = {
@@ -54,7 +55,7 @@ SERVING_INFRA = [
 ]
 CV_KEYWORDS = [
     "computer vision","segmentation","detection","map","yolo","mask r-cnn","opencv",
-    "pytorch","tensorflow","onnx","tensorrt","real-time","tracking"
+    "pytorch","tensorflow","real-time","tracking"
 ]
 LLM_KEYWORDS = [
     "llm","generative ai","transformer","rag","retrieval","faiss","pinecone","vector db",
@@ -68,24 +69,32 @@ GENERAL_ML = [
 # Company slugs to scan (quick but useful cross-section; add more anytime)
 COMPANY_SOURCES = {
     "greenhouse": [
-        # AI/Infra/DevTools/SaaS (many are remote-friendly)
         "openai","databricks","stripe","datadog","notion","snowflakeinc","cloudflare",
         "pinterest","airbnb","instacart","robinhood","reddit","discord","roblox",
         "doordash","dropbox","affirm","brex","scaleai","getcruise","andurilindustries",
-        "anthropic",  # some orgs moved; if empty, it's skipped gracefully
-        "huggingface", "figma", "samsara", "confluent", "ramp", "asana", "plaid",
-        "snyk", "coursera", "mongodb", "shopify", "grafana", "hashicorp","openai", "databricks",
+        "anthropic","huggingface","figma","samsara","confluent","ramp","asana","plaid",
+        "snyk","coursera","mongodb","shopify","grafana","hashicorp"
     ],
     "lever": [
         "runwayml","retool","rasa","weightsandbiases","octoai","gong","rivet","replicate",
-        "mosaicml","scaleai",  # duplicates handled by dedupe
-        "hex","prefect","cerebras","snorkelai","loom","samsara", "databricks",
+        "mosaicml","hex","prefect","cerebras","snorkelai","loom","samsara","databricks"
     ],
     "ashby": [
         "Anthropic","Cohere","Mistral","PerplexityAI","ElevenLabs","Adept","Harvey",
-        "Roboflow","CharacterAI","LumaAI","Poolside","TogetherAI","HuggingFace",
+        "Roboflow","CharacterAI","LumaAI","Poolside","TogetherAI","HuggingFace"
     ],
+    "workday": [
+        ("https://mastercard.wd1.myworkdayjobs.com/en-US/CorporateCareers", "Mastercard"),
+        ("https://charter.wd5.myworkdayjobs.com/en-US/SearchJobs", "Charter Communications"),
+        ("https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite", "NVIDIA"),
+        ("https://tesla.wd5.myworkdayjobs.com/en-US/TeslaCareers", "Tesla"),
+        ("https://adobe.wd5.myworkdayjobs.com/en-US/external_experienced", "Adobe"),
+    ],
+    "workable": [
+        "roboflow", "hex-technologies", "prefect-io", "weaviate", "replicate", "octoai"
+    ]
 }
+
 
 # --- US-only helpers ---
 
@@ -215,7 +224,7 @@ def guess_work_mode(location_str: str) -> str:
 def is_local_stl(location_str: str, radius_km: int = 50) -> bool:
     # String-based heuristic: accept if includes St. Louis or nearby IL side.
     l = to_lower(location_str)
-    hints = ["st. louis", "st louis", "saint louis", "chesterfield", "clayton", "creve coeur", "st charles", "st. charles", "edwardsville", "o'fallon", "o fallon", "belleville"]
+    hints = ["st. louis", "st louis", "saint louis", "chesterfield", "clayton", "creve coeur", "st charles", "edwardsville", "o'fallon", "belleville"]
     states = ["mo", "missouri", "il", "illinois"]
     if any(h in l for h in hints) and any(st in l for st in states):
         return True
@@ -350,10 +359,78 @@ def fetch_ashby(org: str) -> List[dict]:
         })
     return out
 
+def fetch_workday(base_url: str, company: str) -> List[dict]:
+    """
+    Generic Workday job fetcher.
+    base_url = Workday jobs API endpoint up to /fs or /tas
+    e.g., Mastercard: https://mastercard.wd1.myworkdayjobs.com/en-US/CorporateCareers
+    """
+    jobs = []
+    # Workday uses offset pagination
+    offset, page_size = 0, 50
+    while True:
+        url = f"{base_url}/fs/search/jobs?offset={offset}&limit={page_size}"
+        r = http_get(url)
+        if not r: break
+        data = r.json()
+        postings = data.get("jobPostings", [])
+        if not postings: break
+        for j in postings:
+            title = j.get("title") or ""
+            location = ", ".join(j.get("locationsText", [])) if j.get("locationsText") else ""
+            urlj = j.get("externalPath") or ""
+            if urlj and not urlj.startswith("http"):
+                urlj = base_url.split("/fs")[0] + urlj
+            jobs.append({
+                "source": "workday",
+                "company": company,
+                "title": title,
+                "location": location,
+                "url": urlj,
+                "posted_at": j.get("postedOn"),
+                "description": j.get("externalPostingDescription") or "",
+                "employment_type": j.get("timeType") or None,
+                "salary_min": None,
+                "salary_max": None,
+            })
+        offset += page_size
+        if offset >= data.get("total", 0):
+            break
+    return jobs
+
+def fetch_workable(slug: str) -> List[dict]:
+    """
+    Public Workable jobs API (published roles only).
+    Example slug: 'roboflow' -> https://apply.workable.com/api/v3/accounts/roboflow/jobs?state=published
+    """
+    jobs = []
+    url = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+    r = http_get(url, params={"state":"published"})
+    if not r: 
+        return jobs
+    data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+    for j in data.get("jobs", []):
+        jobs.append({
+            "source": "workable",
+            "company": slug,
+            "title": j.get("title") or "",
+            "location": (j.get("location") or {}).get("location_str") or (j.get("location") or {}).get("city") or "",
+            "url": j.get("url") or "",
+            "posted_at": j.get("published_on") or j.get("updated_at"),
+            "description": j.get("full_description") or j.get("shortcode") or "",
+            "employment_type": (j.get("employment_type") or {}).get("label"),
+            "salary_min": None,
+            "salary_max": None,
+        })
+    return jobs
+
+
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "lever": fetch_lever,
     "ashby": fetch_ashby,
+    "workday": fetch_workday,
+    "workable": fetch_workable,
 }
 
 # ---------------------------
@@ -472,11 +549,11 @@ def negative_keyword_excluded(title: str, desc: str, cfg: dict) -> bool:
     negs = [n.lower() for n in (cfg.get("filters", {}).get("negative_keywords") or [])]
     text = f"{title}\n{desc}".lower()
     for n in negs:
-        # word boundary match; hyphen/space friendly (e.g., "intern", "unpaid", "commission", "annotator")
         pattern = rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])"
         if re.search(pattern, text):
             return True
     return False
+
 
 
 def employment_type_allowed(et: Optional[str], cfg: dict) -> bool:
@@ -539,6 +616,14 @@ def passes_hard_filters(j: dict, cfg: dict) -> bool:
     # Work mode + locality/US rules
     if not allowed_by_location_and_mode(j["location"], j["work_mode"], cfg, j.get("description",""), j.get("url","")):
         DROP_COUNTS["location"] += 1
+        if len(DROPPED_LOCATION_SAMPLES) < 20:
+            DROPPED_LOCATION_SAMPLES.append({
+                "title": j["title"],
+                "company": j["company"],
+                "location": j["location"],
+                "mode": j["work_mode"],
+                "url": j["url"]
+            })
         return False
 
     # Employment type
@@ -598,20 +683,32 @@ def save_seen(seen_path: Optional[str], ids: List[str]):
 # ---------------------------
 
 def collect_jobs(cfg: dict) -> List[dict]:
-    allowed_sources = cfg.get("sources_allowed") or ["greenhouse","lever","ashby"]
+    allowed_sources = cfg.get("sources_allowed") or ["greenhouse", "lever", "ashby", "workday"]
     jobs: List[dict] = []
     for source in allowed_sources:
-        if source not in FETCHERS: 
+        if source not in FETCHERS:
             continue
         fetch = FETCHERS[source]
         slugs = COMPANY_SOURCES.get(source, [])
         for slug in slugs:
-            r = fetch(slug)
-            # polite delay
-            time.sleep(0.3)
-            for j in r:
-                jobs.append(j)
+            if source == "workday":
+                # slug is a (url, company name) tuple
+                url, cname = slug
+                try:
+                    r = fetch(url, cname)
+                except Exception as e:
+                    print(f"  [!] workday fetch failed for {cname}: {e}")
+                    r = []
+            else:
+                try:
+                    r = fetch(slug)
+                except Exception as e:
+                    print(f"  [!] {source} fetch failed for {slug}: {e}")
+                    r = []
+            time.sleep(0.3)  # polite delay
+            jobs.extend(r)
     return jobs
+
 
 def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Normalize
@@ -725,6 +822,11 @@ def main():
         print(f"    appended {len(df_all)} IDs to {seen_path}")
 
     print("Drop reasons:", DROP_COUNTS)
+    
+    if DROPPED_LOCATION_SAMPLES:
+        pd.DataFrame(DROPPED_LOCATION_SAMPLES).to_csv("out/dropped_location_samples.csv", index=False)
+        print(f"    wrote {len(DROPPED_LOCATION_SAMPLES)} sample location-dropped jobs to out/dropped_location_samples.csv")
+    
     print("Done ✅")
 
 if __name__ == "__main__":

@@ -47,3 +47,4 @@ environment:
   os: "macOS"
   python: "3.11"
   resume_path: "./resume/mariah_banu.pdf"
+
