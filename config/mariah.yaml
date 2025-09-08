@@ -1,0 +1,49 @@
+candidate: "Syeda Mariah Banu"
+titles:
+  include: ["Machine Learning Engineer","AI Engineer","Applied Scientist","Computer Vision Engineer","Data Scientist"]
+  exclude_exact: ["Director","VP","Principal","Staff"]
+  allow_adjacent: true
+seniority: {min: "junior", max: "senior"}
+
+locations:
+  remote_ok: true
+  local_roles_regions:
+    - name: "Greater St. Louis (MO-IL)"
+      center: "St. Louis, MO"
+      radius_km: 50
+      remote_country_whitelist: ["US","USA","United States","U.S."]
+      remote_strict: false   # 👈 accept plain "Remote" if not explicitly non-US
+work_mode: ["remote","hybrid","onsite"]
+
+filters:
+  employment_type: ["full-time","contract"]
+  salary_floor_usd: null
+  visa_requires_sponsorship: null
+  industries:
+    prefer: []
+    avoid: ["Banking"]
+  negative_keywords: ["intern","content writer","annotator","commission","unpaid"]
+
+sources_allowed: ["greenhouse","lever","ashby","workable","workday","google_jobs"]
+post_age_days_max: 45
+
+companies:
+  prefer: ["Mastercard","Charter Communications"]
+  avoid: []
+
+scoring_bias:
+  emphasize: ["Computer Vision","LLM/RAG","Model Serving on Kubernetes","FastAPI","MLflow","AWS EKS","ONNX","TensorRT"]
+
+output:
+  excel_path: "./out/Top50_Mariah.xlsx"
+  extra_columns: []
+
+run:
+  frequency: "daily"
+  persist_seen_in_csv: true
+  seen_csv_path: "./out/seen_jobs.csv"
+
+environment:
+  os: "macOS"
+  python: "3.11"
+  resume_path: "./resume/mariah_banu.pdf"

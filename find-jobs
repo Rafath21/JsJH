@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# Pick a Python (3.11 if available, else python3)
+PY="python3"
+if command -v python3.11 >/dev/null 2>&1; then PY="python3.11"; fi
+
+# Create venv on first run (or if missing)
+[ -d ".venv" ] || $PY -m venv .venv
+
+# Activate venv + install deps (quiet, idempotent)
+source .venv/bin/activate
+python -m pip -q install --upgrade pip wheel
+python -m pip -q install -r requirements.txt
+
+# Ensure output dir exists
+mkdir -p out
+
+# Run the job finder (script to be added later)
+# Writes a dated Excel each run and maintains seen_jobs.csv
+python src/main.py \
+  --config config/mariah.yaml \
+  --out "out/Top50_Mariah_$(date +%F).xlsx" \
+  --seen "out/seen_jobs.csv"
