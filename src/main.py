@@ -35,6 +35,17 @@ import numpy as np
 # Config + constants
 # ---------------------------
 
+# Job limit configuration - adjust this value to change the number of jobs returned
+MAX_JOBS_LIMIT = 1
+
+US_ALIASES = {
+    "US",
+    "USA",
+    "U.S.",
+    "UNITED STATES",
+    "UNITED STATES OF AMERICA",
+}
+
 DEFAULT_TIMEOUT = 20
 USER_AGENT = "Top50-JobFinder/1.0 (+personal use; respectful rate limit)"
 TODAY = datetime.now(timezone.utc)
@@ -232,6 +243,10 @@ def guess_work_mode(location_str: str, desc: str = "") -> str:
         return "hybrid"
     return "onsite"
 
+def is_non_remote(work_mode: str) -> bool:
+    """Check if work mode is NOT remote (i.e., onsite or hybrid)"""
+    return work_mode.lower() in ("onsite", "hybrid")
+
 def is_local_stl(location_str: str, radius_km: int = 50) -> bool:
     # String-based heuristic: accept if includes St. Louis or nearby IL side.
     l = to_lower(location_str)
@@ -322,7 +337,7 @@ def fetch_lever(slug: str) -> List[dict]:
         urlj = j.get("hostedUrl") or j.get("applyUrl") or ""
         posted = j.get("createdAt")
         if isinstance(posted, (int, float)):
-            posted = datetime.utcfromtimestamp(posted/1000).isoformat()
+            posted = datetime.fromtimestamp(posted/1000, tz=timezone.utc).isoformat()
         desc = j.get("descriptionPlain") or j.get("description") or ""
         out.append({
             "source": "lever",
@@ -765,17 +780,107 @@ def filter_and_rank(all_jobs: List[dict], cfg: dict, seen_ids: set[str], resume_
     # Sort
     candidates.sort(key=lambda x: x["relevance_score"], reverse=True)
 
-    # Top-50
-    top_k = int(cfg.get("top_k", 50))
-    top50 = candidates[:top_k]
+    # Top-N jobs (configurable via MAX_JOBS_LIMIT constant)
+    top_k = int(cfg.get("top_k", MAX_JOBS_LIMIT))
+    top_jobs = candidates[:top_k]
 
     # Build DataFrames
     cols = ["title","company","location","work_mode","posted_at","salary_min","salary_max","currency",
             "employment_type","seniority","tech_stack","url","source","relevance_score","why_it_matches",
             "review_sim","review_reason"]
     df_all = pd.DataFrame(candidates, columns=cols)
-    df_top = pd.DataFrame(top50, columns=cols)
-    return df_top, df_all
+    df_top = pd.DataFrame(top_jobs, columns=cols)
+
+    loc_cfg = cfg.get("locations", {})
+    remote_strict = bool(loc_cfg.get("remote_strict", False))
+    wl = {x.strip().upper() for x in loc_cfg.get("remote_country_whitelist", [])} | US_ALIASES
+
+    def infer_country_from_location(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        t = text.strip().lower()
+
+        # Clear US markers
+        if re.search(r"\b(united states|u\.s\.a?|usa|us)\b", t) or "remote - us" in t or "us remote" in t:
+            return "US"
+
+        # Lightweight non-US hints (expand as needed)
+        non_us_map = {
+            # Canada
+            "canada": "CA", "toronto": "CA", "vancouver": "CA", "montreal": "CA", "ottawa": "CA",
+            # UK / Ireland
+            "united kingdom": "UK", "uk": "UK", "london": "UK", "manchester": "UK", "edinburgh": "UK",
+            "ireland": "IE", "dublin": "IE",
+            # Europe
+            "france": "FR", "paris": "FR", "lyon": "FR",
+            "germany": "DE", "berlin": "DE", "munich": "DE", "frankfurt": "DE", "hamburg": "DE", "cologne": "DE", "köln": "DE",
+            "netherlands": "NL", "amsterdam": "NL", "rotterdam": "NL", "eindhoven": "NL",
+            "spain": "ES", "madrid": "ES", "barcelona": "ES",
+            "switzerland": "CH", "zurich": "CH", "geneva": "CH", "basel": "CH",
+            "sweden": "SE", "stockholm": "SE",
+            "norway": "NO", "oslo": "NO",
+            "denmark": "DK", "copenhagen": "DK",
+            "finland": "FI", "helsinki": "FI",
+            "belgium": "BE", "brussels": "BE",
+            "poland": "PL", "warsaw": "PL", "krakow": "PL", "kraków": "PL",
+            # Middle East / APAC / LatAm
+            "israel": "IL", "tel aviv": "IL", "tel-aviv": "IL",
+            "india": "IN", "bangalore": "IN", "bengaluru": "IN", "hyderabad": "IN", "pune": "IN", "mumbai": "IN", "delhi": "IN",
+            "australia": "AU", "sydney": "AU", "melbourne": "AU", "brisbane": "AU",
+            "singapore": "SG",
+            "mexico": "MX", "mexico city": "MX", "cdmx": "MX",
+            "japan": "JP", "tokyo": "JP", "osaka": "JP",
+            "south korea": "KR", "seoul": "KR", "korea": "KR",
+        }
+        for key, code in non_us_map.items():
+            if key in t:
+                return code
+        return ""  # unknown
+
+    def row_country(row) -> str:
+        # Prefer explicit country column if present
+        for c in ("country", "Country", "COUNTRY"):
+            if c in row and isinstance(row[c], str) and row[c].strip():
+                return row[c].strip().upper()
+        # Fallback: infer from 'location'
+        loc_val = row.get("location", "") if hasattr(row, "get") else row["location"] if "location" in row else ""
+        return infer_country_from_location(loc_val).upper()
+
+    def within_any_local_region(row) -> bool:
+        # location text from the row
+        loc = row.get("location", "") if hasattr(row, "get") else (row["location"] if "location" in row else "")
+        loc = (loc or "")
+
+        # regions from config
+        regs = (cfg.get("locations") or {}).get("local_roles_regions") or []
+        for r in regs:
+            radius = r.get("radius_km", 50)
+            name   = (r.get("name") or "").lower()
+            center = (r.get("center") or "").lower()
+
+            # Known St. Louis matcher (uses your existing heuristic)
+            if "st. louis" in name or "st louis" in name:
+                if is_local_stl(loc, radius):
+                    return True
+
+            # Generic fallback: if a center string is provided, do a substring match
+            if center and center in (loc or "").lower():
+                return True
+
+        return False
+
+    if remote_strict:
+        # Strict: keep ONLY jobs whose country is in the whitelist, regardless of work_mode
+        df = df_all[df_all.apply(lambda r: row_country(r) in wl, axis=1)]
+    else:
+        # Non-strict (previous behavior): at least make onsite/hybrid US-only
+        df = df_all[df_all.apply(lambda r: (str(r.get("work_mode",""))).lower() == "remote" or (row_country(r) in wl), axis=1)]
+
+    # Assuming you already have a function that marks rows within the configured local radius,
+    # e.g., `within_any_local_region(row) -> bool`. If not, keep this out.
+    df = df[df.apply(lambda r: (not is_non_remote(r.get("work_mode",""))) or within_any_local_region(r), axis=1)]
+
+    return df_top, df
 
 def export_excel(df_top: pd.DataFrame, df_all: pd.DataFrame, cfg: dict, out_path: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -788,9 +893,9 @@ def export_excel(df_top: pd.DataFrame, df_all: pd.DataFrame, cfg: dict, out_path
             frame["posted_at"] = pd.to_datetime(frame["posted_at"], errors="coerce").dt.tz_localize(None)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        # Top 50
+        # Top Jobs
         df_top_sorted = df_top.sort_values("relevance_score", ascending=False)
-        df_top_sorted.to_excel(writer, sheet_name="Top 50", index=False)
+        df_top_sorted.to_excel(writer, sheet_name="Top Jobs", index=False)
 
         # All Candidates
         df_all_sorted = df_all.sort_values("relevance_score", ascending=False)
@@ -865,6 +970,23 @@ def main():
         (cfg.get("review", {}) or {}).get("embed_model", "BAAI/bge-small-en-v1.5")
     )[0]
 
+    loc = cfg.get("locations", {})
+    wl = loc.get("remote_country_whitelist")
+
+    # Fallback: if someone still put the whitelist inside the first region, hoist it
+    if not wl:
+        regions = loc.get("local_roles_regions", []) or []
+        if regions and isinstance(regions[0], dict):
+            wl = regions[0].get("remote_country_whitelist")
+        if wl:
+            loc["remote_country_whitelist"] = wl
+
+    # Reasonable default if still missing
+    if not loc.get("remote_country_whitelist"):
+        loc["remote_country_whitelist"] = ["US", "USA", "United States", "U.S."]
+
+    cfg["locations"] = loc
+
 
     out_path = args.out or (cfg.get("output", {}).get("excel_path") or f"./out/Top50_Mariah_{datetime.now().date()}.xlsx")
     seen_path = args.seen or (cfg.get("run", {}).get("seen_csv_path"))
@@ -881,16 +1003,12 @@ def main():
     df_top, df_all = filter_and_rank(all_jobs, cfg, seen_ids, resume_vec)
 
     # Auto-relax...
-    if len(df_all) < 50 and cfg.get("locations", {}).get("remote_ok", False):
+    if len(df_all) < MAX_JOBS_LIMIT and cfg.get("locations", {}).get("remote_ok", False):
         print("    too few results — relaxing remote strictness and retrying once...")
         cfg_relaxed = json.loads(json.dumps(cfg))
         cfg_relaxed.setdefault("locations", {})["remote_strict"] = False
         df_top, df_all = filter_and_rank(all_jobs, cfg_relaxed, seen_ids, resume_vec)
         print(f"    after relax: kept {len(df_all)}; top {len(df_top)}")
-
-    print(f"[4/4] Exporting Excel → {out_path}")
-    export_excel(df_top, df_all, cfg, out_path)
-
 
     print(f"    kept: {len(df_all)} candidates; top: {len(df_top)}")
 

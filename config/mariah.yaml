@@ -7,12 +7,16 @@ seniority: {min: "junior", max: "senior"}
 
 locations:
   remote_ok: true
+  remote_strict: true            # <-- turn on strict country check for remote
+  remote_country_whitelist:      # <-- move here (top-level under locations)
+    - US
+    - USA
+    - United States
+    - U.S.
   local_roles_regions:
-    - name: "Greater St. Louis (MO-IL)"
+    - name: Greater St. Louis (MO-IL)
       center: "St. Louis, MO"
       radius_km: 50
-      remote_country_whitelist: ["US","USA","United States","U.S."]
-      remote_strict: false   # 👈 accept plain "Remote" if not explicitly non-US
 work_mode: ["remote","hybrid","onsite"]
 
 filters:
