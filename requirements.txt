@@ -7,3 +7,14 @@ python-dateutil
 PyYAML
 rapidfuzz
 sentence-transformers
+
+# LLM Model Comparison Dependencies
+torch>=2.0.0
+transformers>=4.35.0
+accelerate>=0.24.0
+datasets>=2.14.0
+tokenizers>=0.14.0
+
+# Optional GPU acceleration
+# torch-audio  # Uncomment if needed
+# torchvision  # Uncomment if needed

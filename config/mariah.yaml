@@ -59,3 +59,21 @@ review:
   hard_keywords_any: ["Computer Vision","LLM","RAG","Kubernetes","FastAPI","MLflow","TensorRT","ONNX"]
   hard_negatives_any: ["IT Helpdesk","Sales","Account Executive","Banking","Finance Auditor"]
 
+# Model comparison configuration
+model_comparison:
+  enabled: true                    # Set to false after initial comparison
+  models: ["qwen25"]               # Test only Qwen 2.5 for now
+  job_limit: 5                     # Number of jobs to test each model on
+  auto_select_winner: false        # Automatically update config with winner
+  
+# LLM configuration for resume tailoring
+llm:
+  selected_model: null             # Will be set by model comparison
+  torch_dtype: "float16"           # Memory optimization
+  device: "auto"                   # Let transformers decide GPU/CPU
+  generation_params:
+    temperature: 0.3
+    max_tokens: 1024
+    top_p: 0.9
+    top_k: 50
+

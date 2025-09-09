@@ -31,12 +31,24 @@ from rapidfuzz import fuzz, process
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
+# Model comparison imports
+try:
+    import sys
+    import os
+    sys.path.append(os.path.dirname(__file__))
+    from model_comparator import ModelComparator
+    from resume_parser import ResumeParser
+    MODEL_COMPARISON_AVAILABLE = True
+except ImportError as e:
+    print(f"Model comparison not available: {e}")
+    MODEL_COMPARISON_AVAILABLE = False
+
 # ---------------------------
 # Config + constants
 # ---------------------------
 
 # Job limit configuration - adjust this value to change the number of jobs returned
-MAX_JOBS_LIMIT = 1
+MAX_JOBS_LIMIT = 5
 
 US_ALIASES = {
     "US",
@@ -1009,6 +1021,48 @@ def main():
         cfg_relaxed.setdefault("locations", {})["remote_strict"] = False
         df_top, df_all = filter_and_rank(all_jobs, cfg_relaxed, seen_ids, resume_vec)
         print(f"    after relax: kept {len(df_all)}; top {len(df_top)}")
+
+    # Model comparison on first N jobs (if enabled)
+    if cfg.get("model_comparison", {}).get("enabled", False) and MODEL_COMPARISON_AVAILABLE:
+        print("[3.5/4] Running model comparison...")
+        try:
+            comparator = ModelComparator(
+                models_to_test=cfg.get("model_comparison", {}).get("models", ["phi35", "llama32", "qwen25"])
+            )
+            
+            # Convert top jobs to list of dicts for comparison
+            top_jobs_list = df_top.to_dict('records')
+            comparison_limit = cfg.get("model_comparison", {}).get("job_limit", 5)
+            
+            results = comparator.run_comparison(top_jobs_list, limit=comparison_limit)
+            
+            # Save results
+            output_dir = os.path.dirname(out_path)
+            comparison_output = os.path.join(output_dir, "model_comparison_results.json")
+            comparator.save_results(comparison_output)
+            
+            print(f"🏆 Model Comparison Results:")
+            print(f"    Winner: {results.winner}")
+            print(f"    {results.recommendation}")
+            print(f"    Detailed results saved to: {comparison_output}")
+            
+            # Show resume generation summary
+            comparator.print_resume_generation_summary()
+            
+            # Optionally update config to use winning model for future runs
+            if cfg.get("model_comparison", {}).get("auto_select_winner", False):
+                if not cfg.get("llm"):
+                    cfg["llm"] = {}
+                cfg["llm"]["selected_model"] = results.winner
+                print(f"    Updated config to use winning model: {results.winner}")
+            
+            # Clean up models
+            comparator.cleanup()
+            
+        except Exception as e:
+            print(f"    ❌ Model comparison failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     print(f"    kept: {len(df_all)} candidates; top: {len(df_top)}")
 
